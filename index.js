@@ -5,13 +5,13 @@ const fs = require('fs');
 
 // ========== 核心配置（你只需要改这里！） ==========
 const CONFIG = {
-  pageUrl: 'http://localhost:5173',       // 你的二维码生成页面地址
+  pageUrl: 'http://localhost:5173',       // 你的二维码页面地址
   excelPath: path.resolve(__dirname, 'data.xlsx'), // Excel文件路径
   saveDir: path.resolve(__dirname, 'qrcode_screenshots'), // 截图保存文件夹
   serialStart: 1,            // 全局起始流水号（所有截图连续编号）
   serialLen: 3,             // 流水号位数（3=001，4=0001）
   headless: false,          // false=可视化运行，true=后台静默运行
-  slowMo: 300,               // 操作延迟（避免页面没加载完）
+  slowMo: 300,               // 操作延迟（适配页面渲染速度）
   timeout: 20000            // 等待超时时间
 };
 
@@ -20,7 +20,7 @@ if (!fs.existsSync(CONFIG.saveDir)) fs.mkdirSync(CONFIG.saveDir);
 
 // ========== 工具函数 ==========
 /**
- * 读取Excel：物料号(A列)、图号(B列)、个数(C列)
+ * 读取Excel：A列物料号、B列图号、C列个数
  */
 function readExcel() {
   const workbook = XLSX.readFile(CONFIG.excelPath);
@@ -33,11 +33,11 @@ function readExcel() {
     const row = rows[i];
     const materialCode = row[0]?.toString().trim(); // 物料号
     const drawingCode = row[1]?.toString().trim(); // 图号
-    const description = row[2]?.toString().trim(); // 描述
+    const description = row[2]?.toString().trim(); // 图号
     const count = parseInt(row[3]) || 0;            // 个数
     
-    if (materialCode && drawingCode && description && count > 0) {
-      data.push({ materialCode, drawingCode, description,count });
+    if (materialCode && drawingCode &&description && count > 0) {
+      data.push({ materialCode, drawingCode,description, count });
     }
   }
   return data;
@@ -70,18 +70,17 @@ function generateQrContent(materialCode, drawingCode, count) {
   
   // 循环个数，生成 1~count 行编码
   for (let i = 1; i <= count; i++) {
-    // 序号补零（01、02...）
     const serial = String(i).padStart(2, '0');
     // 编码格式：物料号 图号 日期+序号
     const line = `${materialCode} ${drawingCode} ${dateStr}${serial}`;
     contentList.push(line);
   }
   
-  // 用换行符拼接所有内容（适配输入框多行输入）
+  // 换行拼接，适配输入框
   return contentList.join('\n');
 }
 
-// ========== 主逻辑：批量生成+分页截图 ==========
+// ========== 主逻辑：基于ID精准定位 ==========
 async function run() {
   // 1. 读取Excel数据
   const taskList = readExcel();
@@ -100,52 +99,57 @@ async function run() {
   await page.goto(CONFIG.pageUrl);
   await page.waitForLoadState('networkidle');
 
-  // 全局流水号（所有截图连续递增）
+  // 全局流水号
   let globalSerial = CONFIG.serialStart;
 
   // 3. 循环处理每个物料
   for (const task of taskList) {
     const { materialCode, drawingCode,description, count } = task;
     console.log(`\n====================================`);
-    console.log(`处理物料：${materialCode} | 图号：${drawingCode} | 描述：${description} | 个数：${count}`);
+    console.log(`处理物料：${materialCode} | 图号：${drawingCode} | 个数：${count}`);
 
     try {
-      // 生成二维码多行内容
+      // ==================== 核心：ID精准定位操作 ====================
+      // 1. 清空并填写【物料名字输入框】ID: prtName
+      await page.locator('#prtName').fill('');
+      await page.locator('#prtName').fill(description); // 填入物料号
+
+      // 2. 生成并填写【二维码内容输入框】ID: codeText
       const qrContent = generateQrContent(materialCode, drawingCode, count);
+      await page.locator('#codeText').fill('');
+      await page.locator('#codeText').fill(qrContent);
+
+      // 3. 点击【生成二维码阵列】按钮 ID: generate
+      await page.locator('#generate').click();
+      await page.locator('#generate').click();
       
-      // 清空输入框 → 填入内容 → 点击生成按钮
-      const inputBox = page.getByRole('textbox'); // 输入框选择器（通用适配）
-      await inputBox.fill('');
-      await inputBox.fill(qrContent);
-      await page.getByRole('button', { name: '生成二维码' }).click(); // 生成按钮
-      await page.waitForSelector('#printArea', { timeout: CONFIG.timeout }); // 等待二维码区域加载
+      // 4. 等待二维码区域加载完成 ID: printArea
+      await page.locator('#printArea').waitFor({ state: 'visible', timeout: CONFIG.timeout });
       await page.waitForTimeout(800);
 
-      // ========== 核心：分页循环截图 ==========
+      // ==================== 分页循环截图 ====================
       let hasNextPage = true;
       while (hasNextPage) {
-        // 1. 生成当前截图文件名
+        // 生成截图文件名
         const serialStr = getSerial(globalSerial);
         const screenshotPath = path.join(CONFIG.saveDir, `${serialStr}.png`);
 
-        // 2. 截图（精准截取二维码区域）
+        // 截取二维码区域（ID: printArea 精准截图）
         await page.locator('#printArea').scrollIntoViewIfNeeded();
         await page.locator('#printArea').screenshot({ path: screenshotPath });
         console.log(`✅ 截图保存：${serialStr}.png`);
 
-        // 3. 流水号+1
+        // 流水号递增
         globalSerial++;
 
-        // 4. 查找下一页按钮
+        // 判断并点击【下一页】按钮
         const nextPageBtn = page.getByRole('button', { name: '下一页' });
-        const isDisabled = await nextPageBtn.evaluate(btn => btn.disabled || !btn.offsetParent);
         const isHidden = await nextPageBtn.isHidden().catch(() => true);
 
-        if (isDisabled || isHidden) {
+        if (isHidden) {
           hasNextPage = false;
           console.log('📄 已到最后一页，切换下一个物料');
         } else {
-          // 点击下一页，等待加载
           await nextPageBtn.click();
           await page.waitForTimeout(800);
         }
@@ -157,7 +161,7 @@ async function run() {
     }
   }
 
-  // 4. 结束任务
+  // 4. 完成任务
   await browser.close();
   console.log(`\n🎉 全部任务完成！共生成 ${globalSerial - CONFIG.serialStart} 张截图`);
 }
